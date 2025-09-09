@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	// Important: side-effect import to enable pure-Go sqlite driver
 	_ "modernc.org/sqlite"
+	"strconv"
 )
 
 // ================== MODELS ==================
@@ -28,11 +30,30 @@ type Item struct {
 }
 
 type Audio struct {
-	ID         uint `gorm:"primaryKey"`
+	ID         uint `gorm:"primaryKey,autoIncrement"`
 	Filename   string
 	Path       string
 	UploadedAt time.Time
+	Duration   time.Duration
 }
+
+type AudioResponse struct {
+	ID                  uint `gorm:"primaryKey"`
+	Name                string
+	Trascription        string
+	UploadedAt          string
+	TranscriptionStatus string
+	Duration            time.Duration
+	AudioURI            string
+}
+
+type TextStatus string
+
+const (
+	READY      TextStatus = "READY"
+	IN_PROCESS TextStatus = "IN_PROCESS"
+	ERROR      TextStatus = "ERROR"
+)
 
 // ================== JWT CONFIG ==================
 var jwtKey = []byte("my_secret_key")
@@ -55,7 +76,7 @@ func main() {
 	}
 
 	// AutoMigrate schema
-	db.AutoMigrate(&User{}, &Item{})
+	db.AutoMigrate(&User{}, &Item{}, &Audio{}, &Media{})
 
 	r := gin.Default()
 
@@ -66,6 +87,11 @@ func main() {
 	// Auth routes
 	r.POST("/register", register)
 	r.POST("/login", login)
+
+	// Аудио API
+	r.POST("/audio/upload", uploadAudio)
+	r.GET("/audio/list", listAudio)
+	r.GET("/audio/:id", streamAudio)
 
 	// CRUD routes (protected)
 	authorized := r.Group("/")
@@ -164,6 +190,111 @@ func deleteItem(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "item deleted"})
+}
+
+// Загрузка аудио
+func uploadAudio(c *gin.Context) {
+
+	file, err := c.FormFile("audio")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "audio file required"})
+		return
+	}
+
+	// Save the uploaded file (optional)
+	err = c.SaveUploadedFile(file, "./uploads/"+file.Filename)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot save file"})
+		return
+	}
+
+	// Get form fields
+	name := c.PostForm("name")            // string, you can convert to int
+	durationStr := c.PostForm("duration") // string, you can convert to int
+	//time := c.PostForm("time")            // string
+
+	duration, err := strconv.Atoi(durationStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid duration"})
+		return
+	}
+	audio := Audio{
+		Filename:   name,
+		Duration:   1,
+		UploadedAt: time.Now(),
+		Path:       "./uploads/" + file.Filename,
+	}
+
+	if err := db.Create(&audio).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot save to database"})
+		return
+	}
+
+	// Respond back
+	c.JSON(http.StatusOK, gin.H{
+		"audio_file": file.Filename,
+		"name":       name,
+		"duration":   duration,
+		"time":       "time",
+		"status":     "saved",
+	})
+}
+
+// Получение списка аудио
+func listAudio(c *gin.Context) {
+	var audios []Audio
+
+	// Fetch all audios from DB
+	if err := db.Find(&audios).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Return as JSON
+	var response []AudioResponse
+	for _, a := range audios {
+		response = append(response, AudioResponse{
+			ID:                  a.ID,
+			Name:                a.Filename,
+			AudioURI:            "/audio/" + strconv.Itoa(int(a.ID)),
+			Duration:            a.Duration, // or format how you like
+			UploadedAt:          a.UploadedAt.Format(time.RFC3339),
+			TranscriptionStatus: "ERROR",
+		})
+
+	}
+	fmt.Println(fmt.Println(audioListToString(audios)))
+
+	c.JSON(http.StatusOK, gin.H{
+		"count":  len(response),
+		"audios": response,
+	})
+}
+
+func audioListToString(list []Audio) string {
+	var str = ""
+	for _, audio := range list {
+		str += audio.String()
+	}
+	return str
+}
+
+func (a Audio) String() string {
+	return fmt.Sprintf("Audio[ID=%d, Filename=%s, Path=%s, Duration=%d, UploadedAt=%s]",
+		a.ID, a.Filename, a.Path, a.Duration, a.UploadedAt.Format(time.RFC3339))
+}
+
+// Стриминг аудио с поддержкой Range-запросов
+func streamAudio(c *gin.Context) {
+	id := c.Param("id")
+
+	var audio Audio
+	if err := db.First(&audio, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "audio not found"})
+		return
+	}
+
+	c.File(audio.Path) // gin автоматически поддерживает Range-запросы
 }
 
 // ================== MODELS ==================
